@@ -1,0 +1,26 @@
+# AP controls enforced in code by ap_agent/ap/policy.py.
+# The model cannot override any of these.
+
+auto_post_enabled: true
+auto_post_max_amount: 2500          # above this, a human always approves
+po_required_above: 5000             # non-PO invoices above this need approval
+non_po_auto_post_vendors: []        # ERP vendor ids allowed to auto-post without a PO (utilities, SaaS...)
+min_extraction_confidence: 0.85
+duplicate_window_days: 90
+tax_gl_account: null                # set to post invoice tax to a fixed account; null = ERP tax engine
+
+tolerances:
+  price_pct: 2.0                    # unit price variance vs PO
+  quantity_pct: 0                   # quantity over received / ordered
+  total_abs: 5.00                   # header subtotal variance (both abs and pct must be exceeded)
+  total_pct: 1.0
+
+approval_tiers:                     # first tier whose max_amount covers the invoice
+  - max_amount: 10000
+    approvers: [ap-manager@example.com]
+  - max_amount: 50000
+    approvers: [controller@example.com]
+  - max_amount: null
+    approvers: [cfo@example.com]
+
+payment_run_approvers: [controller@example.com]

@@ -1,0 +1,45 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ap-agent"
+version = "0.1.0"
+description = "Cloud-agnostic accounts-payable AI agent (Claude) with ERP and mailbox connectors"
+requires-python = ">=3.11"
+dependencies = [
+  "anthropic>=2.12,<3",
+  "fastapi>=0.115",
+  "uvicorn[standard]>=0.30",
+  "pydantic>=2.7",
+  "pydantic-settings>=2.3",
+  "httpx>=0.27",
+  "sqlalchemy>=2.0",
+  "pyjwt[crypto]>=2.8",
+  "pyyaml>=6.0",
+  "python-multipart>=0.0.9",
+]
+
+[project.optional-dependencies]
+# LLM provider SDK extras
+bedrock = ["anthropic[bedrock]>=2.12,<3"]
+vertex = ["anthropic[vertex]>=2.12,<3"]
+# Mailbox auth
+gmail = ["google-auth>=2.30", "requests>=2.31"]
+outlook = ["msal>=1.28"]
+# Blob storage / database drivers per cloud
+aws = ["boto3>=1.34", "psycopg[binary]>=3.1"]
+gcp = ["google-cloud-storage>=2.16", "psycopg[binary]>=3.1"]
+azure = ["azure-storage-blob>=12.20", "azure-identity>=1.16", "psycopg[binary]>=3.1"]
+all = ["ap-agent[bedrock,vertex,gmail,outlook,aws,gcp,azure]"]
+dev = ["pytest>=8", "respx>=0.21"]
+
+[project.scripts]
+ap-agent = "ap_agent.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
