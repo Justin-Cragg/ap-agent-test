@@ -18,11 +18,11 @@ from typing import Callable
 
 import httpx
 
-from ap_agent.erp.base import ERPConnector, ERPError, OAuthHTTP, dec, parse_date
+from ap_agent.erp.base import ERPConnector, ERPError, OAuthHTTP, dec, normalize_account, parse_date
 from ap_agent.models import Bill, BillDraft, BillStatus, GLAccount, POLine, PurchaseOrder, Vendor
 
 TOKEN_URL = "https://identity.xero.com/connect/token"
-SCOPES = "accounting.transactions accounting.contacts accounting.settings.read"
+SCOPES = "accounting.transactions accounting.contacts.read accounting.settings.read"
 _STATUS = {"DRAFT": BillStatus.draft, "SUBMITTED": BillStatus.draft, "AUTHORISED": BillStatus.open, "PAID": BillStatus.paid, "VOIDED": BillStatus.void, "DELETED": BillStatus.void}
 
 
@@ -56,6 +56,15 @@ class XeroERP(ERPConnector):
         if refresh and body.get("refresh_token") and body["refresh_token"] != refresh:
             self.token_set("xero_refresh_token", body["refresh_token"])
         return body["access_token"], int(body.get("expires_in", 1800))
+
+    def _paged(self, path: str, key: str, params: dict, max_pages: int = 200) -> list[dict]:
+        rows: list[dict] = []
+        for page in range(1, max_pages + 1):
+            batch = self.api.get(path, params={**params, "page": page}).get(key, [])
+            rows += batch
+            if len(batch) < 100:  # Xero pages are 100 records
+                break
+        return rows
 
     # ------------------------------------------------------------------ reads
     @staticmethod
@@ -100,20 +109,30 @@ class XeroERP(ERPConnector):
         where = f'Type=="ACCPAY"&&Contact.ContactID==guid("{_q(vendor_id)}")'
         if invoice_number:
             where += f'&&InvoiceNumber=="{_q(invoice_number)}"'
-        return [self._bill(i) for i in self.api.get("/Invoices", params={"where": where}).get("Invoices", [])]
+        return [self._bill(i) for i in self._paged("/Invoices", "Invoices", {"where": where})]
 
     def list_open_bills(self, *, due_before=None):
         where = 'Type=="ACCPAY"&&Status=="AUTHORISED"'
         if due_before:
             where += f"&&DueDate<=DateTime({due_before.year},{due_before.month},{due_before.day})"
-        return [self._bill(i) for i in self.api.get("/Invoices", params={"where": where}).get("Invoices", [])]
+        return [self._bill(i) for i in self._paged("/Invoices", "Invoices", {"where": where})]
 
     def list_gl_accounts(self):
         rows = self.api.get("/Accounts", params={"where": 'Status=="ACTIVE"&&(Class=="EXPENSE"||Class=="ASSET")'}).get("Accounts", [])
         return [GLAccount(id=a["Code"], number=a["Code"], name=a.get("Name", ""), type=a.get("Type")) for a in rows if a.get("Code")]
 
+    def vendor_bank_accounts(self, vendor_id: str) -> list[str] | None:
+        rows = self.api.get(f"/Contacts/{vendor_id}").get("Contacts", [])
+        details = rows[0].get("BankAccountDetails") if rows else None
+        return [normalize_account(details)] if details else []
+
     # ------------------------------------------------------------------ writes
-    def create_bill(self, draft: BillDraft) -> Bill:
+    # Xero honours an Idempotency-Key header on POST/PUT, so retries are safe.
+
+    def _line_items(self, draft: BillDraft) -> list[dict]:
+        return [{"Description": ln.description[:4000], "Quantity": float(ln.quantity or 1), "UnitAmount": float(ln.unit_price if ln.unit_price is not None else ln.amount), "AccountCode": ln.gl_account, **({"ItemCode": ln.item_code} if ln.item_code and ln.po_line_id else {})} for ln in draft.lines]
+
+    def create_bill(self, draft: BillDraft, idempotency_key: str) -> Bill:
         inv = {
             "Type": "ACCPAY",
             "Contact": {"ContactID": draft.vendor_id},
@@ -121,7 +140,7 @@ class XeroERP(ERPConnector):
             "Date": draft.invoice_date.isoformat(),
             "LineAmountTypes": "Exclusive" if draft.tax_total else "NoTax",
             "Status": "AUTHORISED",
-            "LineItems": [{"Description": ln.description[:4000], "Quantity": float(ln.quantity or 1), "UnitAmount": float(ln.unit_price if ln.unit_price is not None else ln.amount), "AccountCode": ln.gl_account, **({"ItemCode": ln.item_code} if ln.item_code and ln.po_line_id else {})} for ln in draft.lines],
+            "LineItems": self._line_items(draft),
         }
         if draft.due_date:
             inv["DueDate"] = draft.due_date.isoformat()
@@ -129,11 +148,19 @@ class XeroERP(ERPConnector):
             inv["CurrencyCode"] = draft.currency
         if draft.po_number:
             inv["Reference"] = draft.po_number
-        resp = self.api.post("/Invoices", json={"Invoices": [inv]}).json()
+        resp = self.api.post("/Invoices", json={"Invoices": [inv]}, headers={"Idempotency-Key": idempotency_key}, idempotent=True).json()
         return self._bill(resp["Invoices"][0])
 
-    def record_payment(self, bill: Bill, amount: Decimal, payment_date: date) -> str:
+    def create_credit(self, draft: BillDraft, idempotency_key: str) -> Bill:
+        cn = {"Type": "ACCPAYCREDIT", "Contact": {"ContactID": draft.vendor_id}, "CreditNoteNumber": draft.invoice_number, "Date": draft.invoice_date.isoformat(), "LineAmountTypes": "Exclusive" if draft.tax_total else "NoTax", "Status": "AUTHORISED", "LineItems": self._line_items(draft)}
+        if draft.currency:
+            cn["CurrencyCode"] = draft.currency
+        resp = self.api.request("PUT", "/CreditNotes", json={"CreditNotes": [cn]}, headers={"Idempotency-Key": idempotency_key}, idempotent=True).json()
+        c = resp["CreditNotes"][0]
+        return Bill(id=c["CreditNoteID"], vendor_id=draft.vendor_id, invoice_number=draft.invoice_number, invoice_date=draft.invoice_date, total=-draft.total, balance=-draft.total, currency=draft.currency, status=BillStatus.open)
+
+    def record_payment(self, bill: Bill, amount: Decimal, payment_date: date, idempotency_key: str) -> str:
         if not self.bank_account_code:
             raise ERPError("XERO_BANK_ACCOUNT_CODE is not configured")
         body = {"Payments": [{"Invoice": {"InvoiceID": bill.id}, "Account": {"Code": self.bank_account_code}, "Date": payment_date.isoformat(), "Amount": float(amount)}]}
-        return self.api.request("PUT", "/Payments", json=body).json()["Payments"][0]["PaymentID"]
+        return self.api.request("PUT", "/Payments", json=body, headers={"Idempotency-Key": idempotency_key}, idempotent=True).json()["Payments"][0]["PaymentID"]

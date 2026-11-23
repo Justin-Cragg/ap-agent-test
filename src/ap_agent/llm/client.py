@@ -103,6 +103,8 @@ class LLM:
             params["fallbacks"] = "default"
         if betas:
             params["betas"] = betas
+        if self._server_fallbacks and self.settings.llm_inference_geo:
+            params["inference_geo"] = self.settings.llm_inference_geo  # data residency (Claude API)
         # Cache the stable prefix (tools + system prompt + earlier turns).
         params.setdefault("cache_control", {"type": "ephemeral"})
         return params

@@ -1,49 +1,56 @@
 # AP Agent
 
-An accounts-payable AI agent built on Claude. It reads the AP mailbox (Gmail or Outlook), processes supplier invoices end-to-end against your ERP (NetSuite, Dynamics 365 Business Central, QuickBooks Online or Xero), answers vendor inquiries and prepares payment runs. Financial controls are enforced in code, not left to the model.
+An accounts-payable AI agent built on Claude. It reads AP mailboxes (Gmail or Outlook), processes supplier invoices and credit notes end-to-end against your ERP (NetSuite, Dynamics 365 Business Central, QuickBooks Online or Xero), answers vendor inquiries, prepares payment runs, and answers internal staff questions. Financial controls, permissions and data scoping are enforced in code, not left to the model.
 
-It ships as one container image that runs unchanged on **Google Cloud, AWS or Azure**. Configuration picks the model provider, ERP and mailbox.
+It ships as one container image that runs unchanged on **Google Cloud, AWS or Azure**. Configuration picks the model provider, ERP, mailbox and identity provider.
 
 ```
-            ┌──────────── Gmail / Outlook (Graph) ────────────┐
-            │                                                  │
-   scheduler ─► ap-agent poll ─► extraction (structured output) ─► agent loop (Claude + tools)
- (Cloud Sched./                                                    │
-  EventBridge/                         ┌───────── policy engine (code) ─────────┐
-  ACA jobs)                            │ duplicates · 2/3-way match · approvals │
-                                       └──────────────────┬──────────────────────┘
-                                                          ▼
-                              ERP adapter: NetSuite · Dynamics BC · QuickBooks · Xero
-                                                          │
-            approval UI (FastAPI) ◄── approvers ──────────┘     Postgres (state/audit) · S3/GCS/Blob (files)
+ AP mailboxes ──poll/push──► job queue (Postgres) ──► extraction ──► agent loop (Claude + scoped tools)
+                                   │                                     │
+                                   │                       policy engine (code): duplicates · 2/3-way match ·
+                                   │                       FX · tax · bank verification · approvals · shadow mode
+                                   ▼                                     ▼
+ IdP (SSO) ─► approval / review UI · /ask ──► approvals (RBAC, SoD, MFA) ──► post_invoice job ──► ERP
+                                                     └─► payment run ──► payment executor (separate identity) ──► ERP
+ Hash-chained audit log · encrypted token store · Prometheus metrics · JSON logs · alerts
 ```
 
 ## What it does
 
 | AP function | How |
 |---|---|
-| **Invoice intake** | Polls the AP inbox and stores PDF/image attachments in object storage. Claude reads each document into a typed schema (vendor, number, dates, PO, lines, tax, totals, confidence). |
-| **Vendor validation** | Looks the vendor up in the ERP by name, tax id and sender domain. A sender domain that doesn't match the vendor on file is treated as a fraud signal. |
-| **Duplicate detection** | Deterministic. Normalized invoice numbers are checked against both ERP bills and the agent's own registry, and same amount within a time window counts as a "possible" duplicate. Exact duplicates are blocked. |
-| **PO matching** | Deterministic 3-way match (invoice ↔ PO ↔ receipt) in NetSuite and Business Central. QuickBooks and Xero have no receipts, so they get a 2-way match. Price, quantity and total tolerances are configurable. |
-| **GL coding** | Claude codes non-PO lines from the ERP's chart of accounts and the vendor's default account. |
-| **Approval routing** | A tiered approval matrix by amount. Approvers get an email link to a confirmation page that shows the coding and the reasons approval is needed. |
-| **Bill posting** | Bills are created in the ERP: NetSuite transforms the PO into a bill, Business Central creates and posts a purchase invoice, QuickBooks creates a bill with a `LinkedTxn` to the PO, Xero creates an `ACCPAY` invoice. |
-| **Vendor inquiries** | Answers payment-status and statement questions from ERP data, as in-thread replies (drafts by default). |
-| **Payment runs** | Claude proposes a run: what's due before the next run, plus early-payment discounts still open. **A human must approve the run before any payment is recorded in the ERP.** |
-| **Fraud controls** | Requests to change bank or remittance details are always escalated. The agent has no tool that can edit vendor master data or bank details. |
-| **Audit trail** | Every tool call, decision, approval and posting goes to `audit_log`. |
+| **Intake** | Polls each AP mailbox, or handles push notifications, into a deduplicated job queue. Emails are routed to a legal entity by the AP alias they were sent to. |
+| **Extraction** | Claude reads PDF and image invoices into a typed schema. Printed bank numbers are replaced with an HMAC fingerprint and the last 4 digits before anything is stored or shown to the model. |
+| **Vendor validation** | Searches the ERP by name, tax id and sender domain. A mismatched sender is treated as a fraud signal. |
+| **Duplicates** | Deterministic checks across ERP bills and the agent's registry, per entity and document type. |
+| **PO matching** | 3-way (invoice ↔ PO ↔ receipt) in NetSuite and Business Central; 2-way in QuickBooks and Xero. Matching runs on the document's data, not on the model's coding. |
+| **GL coding** | Claude codes lines, guided by vendor defaults and **coding history, including approver corrections** (a feedback loop). |
+| **Multi-entity / FX / tax** | Each entity has its own ERP connection, functional currency and policy overrides. Approval thresholds apply after FX conversion (ERP rates, or rates entered by controllers). Tax-rate sanity checks. Missing W-9 / TIN flagged for 1099 vendors. |
+| **Approvals** | Tiered by amount, with group approvers, delegation, MFA for payments and large invoices, and separation of duties. Approvers can correct GL coding in the approval screen. |
+| **Posting** | Idempotent ERP writes from a retrying job (NetSuite `externalId`, QuickBooks `requestid`, Xero `Idempotency-Key`, Business Central reconciliation). Credit notes become vendor credits. |
+| **Vendor inquiries** | Status replies go only to DMARC-verified contacts registered for that vendor. Everyone else gets a fixed acknowledgement. |
+| **Payment runs** | The agent proposes a run (due dates, early-payment discounts, partial amounts). After approval, a **separate executor process with its own ERP credentials** records the payments. |
+| **Internal Q&A** | `/ask`: a read-only assistant over invoices, bills, aging and approvals, limited to the entities the user can see. |
+| **Review queue** | Fraud flags, bank-detail changes, disputes, unknown entities, refusals and failed jobs land in `/review`. Clerks resolve items or resubmit corrected coding. |
+| **Audit** | Every decision, approval, posting, reply and admin change goes into an append-only, hash-chained log (`/audit/verify`). |
 
-## Controls the model cannot override
+## Access control (summary)
 
-Everything in `src/ap_agent/ap/policy.py` and `config/policy.yaml`:
+Full detail in [docs/permissions.md](docs/permissions.md).
 
-- **Auto-post only when all of these hold:** the amount is under the limit, the invoice matched within tolerance (or the vendor is on the non-PO allowlist), extraction confidence is high enough, there is no possible duplicate, the currency agrees, and the email wasn't flagged. Anything else goes to approval.
-- **Recomputed on submit.** The tool layer recomputes duplicates and the PO match itself, from the extracted document rather than from the model's coding. If the submitted total differs from the document, the invoice goes to approval.
-- **Approvals are authenticated.** Each approval link carries a per-approval secret. GET requests never change state, so mail scanners can't approve anything. The approver must be on that tier's list, or you can enforce SSO identity with `IDENTITY_HEADER`.
-- **Payments.** The agent can only *propose* a run. Recording payments in the ERP happens in code after approval.
-- **Untrusted content.** Email text and attachments are fenced as untrusted data. Prompt-injected instructions can't reach a dangerous action, because no such tool exists.
-- **Bank-detail changes.** A keyword control flags these before the model even runs.
+- **People** sign in through your IdP. Set `AUTH_MODE` to `oidc` (Entra ID, Okta, Google, Auth0), `iap` (GCP), `alb` (AWS) or `easyauth` (Azure). The app verifies the signed assertion itself; a plain identity header is never trusted.
+- **Roles** come from IdP groups mapped in `config/rbac.yaml`: `auditor`, `ap_clerk`, `ap_manager`, `controller`, `admin`. Each mapping also limits which entities the person can see. Admins have no financial authority.
+- **Machines** use scoped, hashed, revocable API keys (`ap-agent apikey create --name scheduler --scope jobs:run`). Financial-authority scopes can't be granted to keys.
+- **The agent's tools** differ by task (email, payment-run or Q&A) and enforce scoping themselves:
+  - POs and bills are scoped per vendor.
+  - Free-text replies are blocked unless the sender is a verified contact of every vendor whose data the task read.
+  - There's no tool that approves, pays, or edits vendor or bank data.
+- **Separation-of-duties rules:**
+  - A submitter can't approve their own invoice.
+  - An invoice approver can't approve the payment run that pays it.
+  - Policy changes need two people: a proposer and a different approver.
+
+Threats and the controls against them: [docs/threat-model.md](docs/threat-model.md).
 
 ## Model provider (per deployment)
 
@@ -54,93 +61,105 @@ Everything in `src/ap_agent/ap/policy.py` and `config/policy.yaml`:
 | `vertex` | Google Vertex AI | service account (ADC) | Google Cloud |
 | `foundry` | Microsoft Foundry | managed identity or API key | Azure |
 
-- **Default model:** `claude-opus-5-5`, with adaptive thinking, `high` effort for the agent loop and `medium` for extraction.
-- **Prompt caching** is on.
-- **Requests are streamed** so long PDFs don't hit HTTP timeouts.
-- **Refusal fallbacks:** if a safety classifier declines a request, the Claude API retries it server-side on a fallback model (`fallbacks="default"`). On Bedrock, Vertex and Foundry the SDK's client-side fallback middleware does the same job, retrying on `LLM_FALLBACK_MODEL` (`claude-opus-5`). If the request is still declined, or the agent runs out of turns, the email is labelled `AP-Needs-Review` for a human. It is never treated as a silent success.
+- **Default model:** `claude-opus-5-5`, with adaptive thinking, `high` effort for agent tasks and `medium` for extraction.
+- **Prompt caching** is on, and requests are streamed.
+- **Refusal fallbacks:** a declined request is retried on a fallback model, server-side on the Claude API and through the SDK's client-side middleware elsewhere. Anything still declined goes to the review queue.
+- **Data residency:** on the Claude API, `LLM_INFERENCE_GEO` sets where inference runs.
+- **Cost tracking:** every task records token usage and estimated cost (`/reports/costs`, Prometheus `ap_llm_cost_usd_total`).
 
-The agent loop runs on the Messages API inside your container. Anthropic's Managed Agents isn't used because it isn't available on Bedrock, Vertex or Foundry.
-
-## Quick start (local, no cloud)
+## Quick start (local)
 
 ```bash
 python -m venv .venv && . .venv/bin/activate
 pip install -e ".[dev]"
-pytest                       # 33 tests, no network or API spend
-cp .env.example .env         # set ANTHROPIC_API_KEY, API_TOKEN
-ap-agent serve               # http://localhost:8080/healthz
+pytest                        # 73 tests, no network or API spend
+cp .env.example .env          # set ANTHROPIC_API_KEY
+ap-agent serve                # dev mode: identity via X-Dev-User / X-Dev-Groups headers
+curl -H "X-Dev-User: me@example.com" -H "X-Dev-Groups: ap-clerks" localhost:8080/me
 ```
 
-`ERP_PROVIDER=memory` and `MAIL_PROVIDER=memory` give you an in-memory ERP with demo vendors, a PO and GL accounts. When you're ready, switch to a real ERP and mailbox through environment variables. Run `docker compose up` for the same setup with Postgres.
+`ERP_PROVIDER=memory` and `MAIL_PROVIDER=memory` give you a demo ERP and mailbox. `docker compose up` runs the same setup with Postgres.
 
-Run commands:
+### Commands
 
-- `ap-agent poll` processes the inbox once. This is what the scheduler runs.
-- `ap-agent payment-run --date 2026-12-01 --next-run 2026-12-08` proposes a payment run.
+| Command | What it does |
+|---|---|
+| `ap-agent migrate` | Applies Alembic migrations. Advisory-locked, so it's safe on every start. |
+| `ap-agent poll` | Enqueues new mail and processes the queue. Runs on a schedule. |
+| `ap-agent work` | Drains the job queue. |
+| `ap-agent payment-run [--entity US01 --date … --next-run …]` | Proposes a payment run for approval. |
+| `ap-agent execute-payments` | Payment executor. Deploy it with its own identity and ERP credentials. |
+| `ap-agent apikey create\|revoke` | Manages scoped API keys. |
+| `ap-agent audit-verify` | Checks the audit hash chain. |
+| `ap-agent purge` | Deletes stored documents and extracted data past `RETENTION_YEARS`. |
 
-API, with bearer `API_TOKEN`:
+### HTTP endpoints
 
-- `POST /jobs/poll-mailbox`
-- `POST /jobs/payment-run`
-- `GET /invoices`, `/approvals`, `/audit`
-- `/approvals/{id}/{approve|reject}`: the approver UI, authenticated by its link token
-- `POST /webhooks/gmail` (Pub/Sub push) and `POST /webhooks/outlook` (Graph notifications, with `clientState` = `API_TOKEN`), for near-real-time processing
+| Area | Endpoints |
+|---|---|
+| UI | `/approvals/{id}`, `/ui/review`, `/ask` |
+| API | `/me`, `/approvals`, `/api/approvals/{id}`, `/invoices`, `/invoices/{id}/submit`, `/review`, `/vendors/{entity}/{vendor}/contacts`, `/vendors/{entity}/{vendor}/bank-accounts`, `/fx-rates`, `/delegations`, `/policy`, `/policy/proposals`, `/apikeys`, `/audit`, `/audit/verify`, `/reports/shadow`, `/reports/costs`, `/metrics` |
+| Jobs | `/jobs/poll`, `/jobs/work`, `/jobs/payment-run`, `/jobs/purge` |
+| Webhooks | `/webhooks/gmail?token=…` and `/webhooks/outlook` (`clientState` = `WEBHOOK_SECRET`) |
+
+## Rolling out safely
+
+1. **Start in shadow mode** (`auto_post_mode: shadow`, the default). Every invoice goes to a human, and the approval records what the policy *would* have auto-posted. Watch `/reports/shadow` for the agreement rate.
+2. **Measure extraction accuracy** on your own labelled invoices with `python evals/run_extraction_eval.py`. It is billed and asks for confirmation first.
+3. **Run the live sandbox tests:** `pytest -m integration` (read-only, or `AP_IT_ALLOW_WRITES=1` on sandbox companies).
+4. **Switch to live auto-posting.** Propose a policy change setting `auto_post_mode: live`; a controller approves it, per the two-person rule.
 
 ## Connecting an ERP
 
-| ERP | `ERP_PROVIDER` | Setup |
+| ERP | `ERP_PROVIDER` | Notes |
 |---|---|---|
-| NetSuite | `netsuite` | Integration record with OAuth 2.0 client credentials (M2M). Upload a certificate and map it to a role with vendor, PO and vendor bill permissions. Set `NETSUITE_ACCOUNT_ID`, `_CLIENT_ID`, `_CERTIFICATE_ID`, `_PRIVATE_KEY` (PEM) and `_PAYMENT_ACCOUNT_ID`. |
-| Dynamics 365 Business Central | `dynamics_bc` | Entra app registration with `API.ReadWrite.All` on Business Central, added under *Microsoft Entra Applications* in BC. Set the tenant, client id and secret, environment, company id and payment journal id. Payments are added as journal lines, and you post the journal in BC. |
-| QuickBooks Online | `quickbooks` | Intuit app (Accounting scope). Do the consent flow once and set `QUICKBOOKS_REFRESH_TOKEN` and the realm id. Rotated refresh tokens are saved to the database automatically. |
-| Xero | `xero` | Custom Connection (leave `XERO_REFRESH_TOKEN` empty), or a standard OAuth app with a refresh token and `XERO_TENANT_ID`. |
+| NetSuite | `netsuite` | OAuth 2.0 M2M (certificate). `NETSUITE_SUBSIDIARY_ID` per entity. Writes carry `externalId`. |
+| Dynamics 365 Business Central | `dynamics_bc` | Entra app; one entity per BC company. Payments are added as journal lines, and you post the journal in BC. |
+| QuickBooks Online | `quickbooks` | OAuth refresh token (rotated tokens are saved to the secret store, per entity). `requestid` makes writes idempotent. |
+| Xero | `xero` | Custom Connection, or OAuth with a refresh token. `Idempotency-Key` on writes. |
 
-To add an ERP (SAP, Sage Intacct, Dynamics F&O and so on), implement `ERPConnector` in `src/ap_agent/erp/base.py`: eight methods with ERP-neutral models. Then register it in `build_erp`.
+Least-privilege integration users (agent vs payment executor) are described in [docs/permissions.md](docs/permissions.md). For multiple entities, copy `config/entities.example.yaml` to `config/entities.yaml`.
 
 ## Connecting a mailbox
 
-- **Gmail** (`MAIL_PROVIDER=gmail`): either a Workspace service account with domain-wide delegation for `gmail.modify` (`GMAIL_SERVICE_ACCOUNT_JSON`, `GMAIL_USER`), or an OAuth client plus a refresh token for the AP mailbox.
-- **Outlook** (`MAIL_PROVIDER=outlook`): an Entra app with the application permissions `Mail.ReadWrite` and `Mail.Send`. Use an Exchange application access policy to limit it to the AP mailbox.
+- **Gmail:** a Workspace service account with domain-wide delegation for `gmail.modify`, or an OAuth refresh token.
+- **Outlook:** an Entra app with `Mail.ReadWrite` and `Mail.Send`. Restrict it to the AP mailboxes with `deploy/scripts/restrict-outlook-app.ps1`.
 
-Processed mail gets the label or category `AP-Processed`, and anything needing a person gets `AP-Needs-Review`. Replies are **drafts** by default (`MAIL_REPLY_MODE=draft`). Switch to `send` once you trust them.
+Sender authenticity comes from the receiving server's DMARC result. Replies are drafts by default (`MAIL_REPLY_MODE=draft`).
 
 ## Deploying
 
-Build and push the image (`docker build -t <registry>/ap-agent:TAG .`), then apply the module for your cloud:
-
-| Cloud | Module | Runs as | Scheduler | Files | Secrets | Claude |
+| Cloud | Module | SSO and edge protection | Runs as | Scheduler | Files / secrets | Claude |
 |---|---|---|---|---|---|---|
-| Google Cloud | `deploy/terraform/gcp` | Cloud Run service + Cloud Run jobs | Cloud Scheduler | GCS | Secret Manager | Vertex AI |
-| AWS | `deploy/terraform/aws` | ECS Fargate + ALB | EventBridge Scheduler → ECS task | S3 | Secrets Manager | Bedrock |
-| Azure | `deploy/terraform/azure` | Container App + Container Apps jobs | job cron trigger | Blob Storage | Key Vault | Foundry |
+| Google Cloud | `deploy/terraform/gcp` | HTTPS LB + IAP + Cloud Armor (WAF, rate limiting); Cloud Run accepts LB traffic only | Cloud Run service + jobs | Cloud Scheduler | GCS / Secret Manager | Vertex AI |
+| AWS | `deploy/terraform/aws` | ALB `authenticate-oidc` + WAF (managed rules, rate limiting); tasks accept ALB traffic only | ECS Fargate service + tasks | EventBridge Scheduler | S3 / Secrets Manager | Bedrock |
+| Azure | `deploy/terraform/azure` | Container Apps Easy Auth (Entra ID); optional IP allow-list | Container App + jobs | job cron | Blob / Key Vault | Foundry |
 
-- **Secrets:** create them out of band so their values never reach Terraform state, then map env var → secret id, ARN or URI with `secret_env`. Do the same for `DATABASE_URL`, pointing at Cloud SQL, RDS or Azure Database for PostgreSQL. The modules don't create a database.
-- **Model provider:** each module defaults to that cloud's provider. You can still set `LLM_PROVIDER=anthropic` anywhere.
-- **Approval UI and SSO:** put the approval UI behind your cloud's SSO and set `IDENTITY_HEADER`. The options are IAP (`X-Goog-Authenticated-User-Email`), ALB OIDC, or Easy Auth (`X-MS-CLIENT-PRINCIPAL-NAME`).
-- **Azure:** also grant the managed identity *Cognitive Services User* on the Foundry resource.
+Each module creates:
 
-## Project layout
+- separate identities for the agent and the payment executor, with separate secret sets (`secret_env` / `executor_secret_env`);
+- poll, payment-run, purge and payment-executor jobs;
+- storage lifecycle rules matching the retention period;
+- error alerts to `alert_email`.
 
-```
-src/ap_agent/
-  config.py            env-driven settings
-  models.py            ERP-neutral domain model
-  llm/client.py        provider factory, streaming, refusal fallbacks, caching
-  agent/               tool definitions (strict schemas), prompts, agent loop
-  ap/                  extraction, matching, duplicates, policy engine
-  erp/                 netsuite, dynamics (BC), quickbooks, xero, in-memory
-  mail/                gmail, outlook (Graph), in-memory
-  storage/             SQLAlchemy state + audit, blob stores (local/S3/GCS/Azure)
-  pipeline.py          mailbox → extraction → agent; approvals; payment runs
-  api.py / cli.py      FastAPI app, CLI entrypoints
-config/policy.yaml     approval matrix, tolerances, limits
-deploy/terraform/      gcp, aws, azure
-```
+You supply secrets out of band: `DATABASE_URL` (managed Postgres), `SESSION_SECRET`, `WEBHOOK_SECRET`, `BANK_FINGERPRINT_PEPPER`, and the ERP and mailbox credentials. Outside dev, the app refuses to start without auth, encryption keys or Postgres.
+
+CI (`.github/workflows/ci.yml`) runs:
+
+- lint and tests;
+- `pip-audit`;
+- `terraform fmt` and `terraform validate` for all three modules;
+- a container build with a Trivy scan;
+- on `main`: push to GHCR with SBOM/provenance and a keyless cosign signature.
 
 ## Status and known gaps
 
-- **Tests:** the 33 tests cover the controls, the agent loop (with a scripted model), every connector's request and response shapes against mocked HTTP, provider selection and the approval API. **None of it has run against a live ERP, mailbox or cloud account yet.** Run each connector against a sandbox company before production, especially the NetSuite SuiteQL fields, which vary with account customisation.
-- **Terraform:** written but not yet `terraform validate`d or applied.
-- **Bank details:** detection is keyword- and document-based. Comparing against bank details stored in the ERP needs ERP-specific bank-record access, which isn't built yet.
-- **Credit notes:** extracted and flagged, but not yet applied automatically against open bills.
-- **Dynamics 365 Finance & Operations:** not covered. The Dynamics adapter is Business Central only.
+- **Tests:** the 73 tests cover RBAC, SoD, MFA, delegation, DMARC/disclosure scoping, prompt-injection attempts, bank verification, shadow mode, FX, credit notes, idempotent posting, queue retries and dead-lettering, the audit chain, the policy two-person rule, IdP token verification, multi-entity routing, connectors against mocked HTTP, and the API. None of it has run against live ERPs, mailboxes or cloud accounts. Run `pytest -m integration` against sandboxes and let CI validate the Terraform; it hasn't been validated or applied here.
+- **Field names:** some ERP API field names come from the documentation and need confirming on your tenant: NetSuite SuiteQL fields and `currencyrate`, BC `purchaseCreditMemos` fields, and the Bedrock IAM action names.
+- **Not in the code:** a third-party penetration test, SOC 2 evidence collection, IdP hygiene (MFA enforcement, joiner/mover/leaver processes), and WORM export of the audit log. These are organisational steps; see the threat model.
+- **Not yet built:**
+  - managed Postgres provisioning in the Terraform modules;
+  - an Azure edge WAF (Front Door);
+  - Teams or Slack front-ends for `/ask`;
+  - Dynamics 365 Finance & Operations;
+  - automatic application of credit notes against open bills (credits are posted as vendor credits).

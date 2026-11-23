@@ -1,0 +1,34 @@
+# Maps identity-provider groups (or individual users) to AP roles and the legal
+# entities each may see. Roles and their permissions are fixed in code
+# (src/ap_agent/auth.py ROLE_PERMISSIONS):
+#
+#   auditor     read invoices, review queue, audit log, reports
+#   ap_clerk    + resolve review items, submit corrected invoices, ask the agent
+#   ap_manager  + decide approvals (still limited to the approval tiers they're named in),
+#                 manage vendor contacts, delegate approval authority
+#   controller  + verify vendor bank accounts, approve policy changes, maintain FX rates
+#   admin       platform admin: API keys, propose policy changes, run jobs - no financial authority
+#
+# Group names are matched against the token's groups claim (Entra ID: group
+# object IDs or app roles; Okta/Google: group names).
+
+group_roles:
+  ap-clerks:
+    roles: [ap_clerk]
+    entities: ["*"]
+  ap-managers:
+    roles: [ap_manager]
+    entities: ["*"]
+  finance-controllers:
+    roles: [controller]
+    entities: ["*"]
+  internal-audit:
+    roles: [auditor]
+    entities: ["*"]
+  platform-admins:
+    roles: [admin]
+    entities: ["*"]
+
+# Optional direct user mappings (needed with Google IAP, which carries no groups).
+users: {}
+#  ap-manager@example.com: {roles: [ap_manager], entities: [US01]}

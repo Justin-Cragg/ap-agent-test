@@ -19,6 +19,7 @@ class Vendor(BaseModel):
     payment_terms: str | None = None
     active: bool = True
     default_gl_account: str | None = None
+    is_1099: bool = False
 
 
 class POLine(BaseModel):
@@ -95,6 +96,7 @@ class BillDraft(BaseModel):
     po_number: str | None = None
     lines: list[BillLine]
     memo: str | None = None
+    subsidiary_id: str | None = None
 
 
 # --------------------------------------------------------------------- extraction
@@ -118,6 +120,8 @@ class ExtractedInvoice(BaseModel):
     vendor_tax_id: str | None = None
     vendor_address: str | None = None
     remit_to_bank_details_present: bool = False
+    remit_bank_account: str | None = Field(default=None, description="Bank account number or IBAN printed for payment, exactly as printed")
+    remit_bank_routing: str | None = Field(default=None, description="Routing / sort code / BIC printed for payment")
     invoice_number: str | None = None
     invoice_date: str | None = Field(default=None, description="ISO 8601 date")
     due_date: str | None = Field(default=None, description="ISO 8601 date")

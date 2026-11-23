@@ -18,6 +18,9 @@ dependencies = [
   "pyjwt[crypto]>=2.8",
   "pyyaml>=6.0",
   "python-multipart>=0.0.9",
+  "alembic>=1.13",
+  "prometheus-client>=0.20",
+  "cryptography>=42",
 ]
 
 [project.optional-dependencies]
@@ -29,9 +32,10 @@ gmail = ["google-auth>=2.30", "requests>=2.31"]
 outlook = ["msal>=1.28"]
 # Blob storage / database drivers per cloud
 aws = ["boto3>=1.34", "psycopg[binary]>=3.1"]
-gcp = ["google-cloud-storage>=2.16", "psycopg[binary]>=3.1"]
-azure = ["azure-storage-blob>=12.20", "azure-identity>=1.16", "psycopg[binary]>=3.1"]
-all = ["ap-agent[bedrock,vertex,gmail,outlook,aws,gcp,azure]"]
+gcp = ["google-cloud-storage>=2.16", "google-cloud-secret-manager>=2.20", "psycopg[binary]>=3.1"]
+azure = ["azure-storage-blob>=12.20", "azure-identity>=1.16", "azure-keyvault-secrets>=4.8", "psycopg[binary]>=3.1"]
+otel = ["opentelemetry-sdk>=1.25", "opentelemetry-exporter-otlp-proto-http>=1.25", "opentelemetry-instrumentation-fastapi>=0.46b0", "opentelemetry-instrumentation-httpx>=0.46b0"]
+all = ["ap-agent[bedrock,vertex,gmail,outlook,aws,gcp,azure,otel]"]
 dev = ["pytest>=8", "respx>=0.21"]
 
 [project.scripts]
@@ -40,6 +44,15 @@ ap-agent = "ap_agent.cli:main"
 [tool.setuptools.packages.find]
 where = ["src"]
 
+[tool.setuptools.package-data]
+ap_agent = ["migrations/*.mako", "migrations/versions/*.py"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["src"]
+markers = ["integration: runs against live ERP/mail sandboxes (needs credentials)"]
+addopts = "-m 'not integration'"
+
+[tool.ruff]
+line-length = 200
+target-version = "py311"

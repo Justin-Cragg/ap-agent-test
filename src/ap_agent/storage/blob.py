@@ -16,6 +16,9 @@ class BlobStore(ABC):
     @abstractmethod
     def get(self, uri: str) -> bytes: ...
 
+    @abstractmethod
+    def delete(self, uri: str) -> None: ...
+
 
 class LocalBlobStore(BlobStore):
     def __init__(self, root: str):
@@ -33,6 +36,9 @@ class LocalBlobStore(BlobStore):
     def get(self, uri: str) -> bytes:
         return Path(uri.removeprefix("file://")).read_bytes()
 
+    def delete(self, uri: str) -> None:
+        Path(uri.removeprefix("file://")).unlink(missing_ok=True)
+
 
 class S3BlobStore(BlobStore):
     def __init__(self, bucket: str, region: str):
@@ -49,6 +55,10 @@ class S3BlobStore(BlobStore):
         bucket, key = uri.removeprefix("s3://").split("/", 1)
         return self.s3.get_object(Bucket=bucket, Key=key)["Body"].read()
 
+    def delete(self, uri: str) -> None:
+        bucket, key = uri.removeprefix("s3://").split("/", 1)
+        self.s3.delete_object(Bucket=bucket, Key=key)
+
 
 class GCSBlobStore(BlobStore):
     def __init__(self, bucket: str):
@@ -64,6 +74,10 @@ class GCSBlobStore(BlobStore):
     def get(self, uri: str) -> bytes:
         bucket, key = uri.removeprefix("gs://").split("/", 1)
         return self.client.bucket(bucket).blob(key).download_as_bytes()
+
+    def delete(self, uri: str) -> None:
+        bucket, key = uri.removeprefix("gs://").split("/", 1)
+        self.client.bucket(bucket).blob(key).delete()
 
 
 class AzureBlobStore(BlobStore):
@@ -84,6 +98,10 @@ class AzureBlobStore(BlobStore):
     def get(self, uri: str) -> bytes:
         container, key = uri.removeprefix("azure://").split("/", 1)
         return self.service.get_blob_client(container, key).download_blob().readall()
+
+    def delete(self, uri: str) -> None:
+        container, key = uri.removeprefix("azure://").split("/", 1)
+        self.service.get_blob_client(container, key).delete_blob()
 
 
 def build_blob_store(settings: Settings) -> BlobStore:

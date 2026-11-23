@@ -18,7 +18,7 @@ from typing import Any, Callable
 
 import httpx
 
-from ap_agent.mail.base import Attachment, EmailMessage, MailboxConnector, PROCESSED_LABEL
+from ap_agent.mail.base import Attachment, EmailMessage, MailboxConnector, PROCESSED_LABEL, dmarc_pass
 
 SCOPES = ["https://www.googleapis.com/auth/gmail.modify"]
 API = "https://gmail.googleapis.com/gmail/v1/users"
@@ -52,7 +52,7 @@ class GmailMailbox(MailboxConnector):
     name = "gmail"
 
     def __init__(self, user: str, token: Callable[[], str], transport: httpx.BaseTransport | None = None):
-        self.user = user
+        self.user = self.address = user
         self._token = token
         self.http = httpx.Client(base_url=f"{API}/{user}", timeout=60, transport=transport)
         self._labels: dict[str, str] = {}
@@ -70,14 +70,29 @@ class GmailMailbox(MailboxConnector):
             self._labels[name] = self._req("POST", "/labels", json={"name": name, "labelListVisibility": "labelShow", "messageListVisibility": "show"})["id"]
         return self._labels[name]
 
-    def list_new_messages(self, lookback_days: int = 7, limit: int = 50) -> list[EmailMessage]:
+    def list_new_messages(self, lookback_days: int = 7, limit: int = 50) -> list[str]:
         q = f"in:inbox -label:{PROCESSED_LABEL} newer_than:{lookback_days}d"
-        refs = self._req("GET", "/messages", params={"q": q, "maxResults": limit}).get("messages", [])
-        return [self._load(ref["id"]) for ref in refs]
+        ids: list[str] = []
+        page_token = None
+        while len(ids) < limit:
+            params = {"q": q, "maxResults": min(100, limit - len(ids))}
+            if page_token:
+                params["pageToken"] = page_token
+            data = self._req("GET", "/messages", params=params)
+            ids += [ref["id"] for ref in data.get("messages", [])]
+            page_token = data.get("nextPageToken")
+            if not page_token:
+                break
+        return ids
+
+    def get_message(self, message_id: str) -> EmailMessage:
+        return self._load(message_id)
 
     def _load(self, msg_id: str) -> EmailMessage:
         msg = self._req("GET", f"/messages/{msg_id}", params={"format": "full"})
-        headers = {h["name"].lower(): h["value"] for h in msg["payload"].get("headers", [])}
+        raw_headers = msg["payload"].get("headers", [])
+        headers = {h["name"].lower(): h["value"] for h in raw_headers}
+        auth_results = [h["value"] for h in raw_headers if h["name"].lower() == "authentication-results"]
         text_parts: list[str] = []
         attachments: list[Attachment] = []
 
@@ -93,11 +108,15 @@ class GmailMailbox(MailboxConnector):
                 walk(child)
 
         walk(msg["payload"])
+        sender = parseaddr(headers.get("from", ""))[1]
         return EmailMessage(
             id=msg["id"],
             thread_id=msg.get("threadId"),
-            sender=parseaddr(headers.get("from", ""))[1],
+            sender=sender,
+            sender_authenticated=dmarc_pass(auth_results, sender.rsplit("@", 1)[-1], ("mx.google.com",)),
+            mailbox=self.user,
             to=[a for _, a in getaddresses([headers.get("to", "")]) if a],
+            cc=[a for _, a in getaddresses([headers.get("cc", "")]) if a],
             subject=headers.get("subject", ""),
             body_text="\n".join(text_parts) or msg.get("snippet", ""),
             received_at=datetime.fromtimestamp(int(msg.get("internalDate", 0)) / 1000, tz=timezone.utc),
@@ -127,5 +146,6 @@ class GmailMailbox(MailboxConnector):
     def send(self, to: list[str], subject: str, body: str) -> str:
         return self._req("POST", "/messages/send", json={"raw": self._raw(to, subject, body)})["id"]
 
-    def label(self, message: EmailMessage, label: str) -> None:
-        self._req("POST", f"/messages/{message.id}/modify", json={"addLabelIds": [self._label_id(label)]})
+    def label(self, message: EmailMessage | str, label: str) -> None:
+        mid = message if isinstance(message, str) else message.id
+        self._req("POST", f"/messages/{mid}/modify", json={"addLabelIds": [self._label_id(label)]})

@@ -1,0 +1,18 @@
+# Copy to config/entities.yaml to run several legal entities from one deployment.
+# Credentials for each entity come from env vars with its prefix, e.g.
+#   US01_ERP_PROVIDER=netsuite  US01_NETSUITE_SUBSIDIARY_ID=1
+#   UK01_XERO_TENANT_ID=...     UK01_XERO_CLIENT_ID=...
+# Emails are routed by the AP alias they were sent to; ambiguous mail goes to the review queue.
+entities:
+  - code: US01
+    name: Example Corp US
+    functional_currency: USD
+    mailbox_aliases: [ap-us@example.com]
+    env_prefix: US01_
+  - code: UK01
+    name: Example Corp UK Ltd
+    functional_currency: GBP
+    mailbox_aliases: [ap-uk@example.com]
+    env_prefix: UK01_
+    overrides:
+      erp_provider: xero

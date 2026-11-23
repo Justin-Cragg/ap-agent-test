@@ -61,7 +61,7 @@ def test_duplicate_exact_and_possible(tmp_path):
 def _decide(**kw):
     base = dict(amount=Decimal("1000"), vendor_id="V1", vendor_active=True, currency_ok=True, duplicate="none", match=None, extraction_confidence=0.95, coding_complete=True)
     base.update(kw)
-    return decide(kw.pop("policy", Policy(non_po_auto_post_vendors=["V1"])), **base)
+    return decide(kw.pop("policy", Policy(non_po_auto_post_vendors=["V1"], auto_post_mode="live")), **base)
 
 
 def test_policy_auto_posts_small_allowed_non_po():
@@ -74,7 +74,7 @@ def test_policy_blocks_exact_duplicate_and_inactive_vendor():
 
 
 def test_policy_requires_approval_and_picks_tier():
-    p = Policy(non_po_auto_post_vendors=["V1"], approval_tiers=[{"max_amount": 10000, "approvers": ["mgr@x"]}, {"max_amount": None, "approvers": ["cfo@x"]}])
+    p = Policy(auto_post_mode="live", non_po_auto_post_vendors=["V1"], approval_tiers=[{"max_amount": 10000, "approvers": ["mgr@x"]}, {"max_amount": None, "approvers": ["cfo@x"]}])
     d = decide(p, amount=Decimal("25000"), vendor_id="V1", vendor_active=True, currency_ok=True, duplicate="none", match=None, extraction_confidence=0.95, coding_complete=True)
     assert d.action == Action.require_approval and d.approvers == ["cfo@x"]
     d = decide(p, amount=Decimal("3000"), vendor_id="V1", vendor_active=True, currency_ok=True, duplicate="none", match=None, extraction_confidence=0.95, coding_complete=True)
@@ -91,3 +91,31 @@ def test_bank_change_detection():
     p = Policy()
     assert p.mentions_bank_change("Please note our NEW BANK details effective immediately")
     assert not p.mentions_bank_change("Attached is invoice 123")
+
+
+def test_policy_shadow_mode_and_mfa_threshold():
+    d = decide(Policy(non_po_auto_post_vendors=["V1"]), amount=Decimal("100"), vendor_id="V1", vendor_active=True, currency_ok=True, duplicate="none", match=None, extraction_confidence=0.95, coding_complete=True)
+    assert d.action == Action.require_approval and d.shadow_auto_post
+    d = _decide(amount=Decimal("60000"))
+    assert d.requires_mfa
+
+
+def test_policy_fx_tax_and_1099():
+    assert any("FX" in r for r in _decide(fx_known=False).reasons)
+    assert any("tax" in r.lower() for r in _decide(tax_ok=False).reasons)
+    assert any("1099" in r for r in _decide(tin_missing=True).reasons)
+
+
+def test_tax_rate_check():
+    from ap_agent.ap.controls import tax_rate_ok
+
+    p = Policy(allowed_tax_rates_pct=[Decimal("0"), Decimal("20")])
+    assert tax_rate_ok(p, Decimal("100"), Decimal("20"))
+    assert not tax_rate_ok(p, Decimal("100"), Decimal("7"))
+    assert tax_rate_ok(Policy(), Decimal("100"), Decimal("7"))
+
+
+def test_entity_policy_overrides():
+    p = Policy(auto_post_max_amount=Decimal("2500"), entities={"UK01": {"auto_post_max_amount": "1000"}})
+    assert p.for_entity("UK01").auto_post_max_amount == Decimal("1000")
+    assert p.for_entity("US01").auto_post_max_amount == Decimal("2500")

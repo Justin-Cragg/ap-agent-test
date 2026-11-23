@@ -5,11 +5,19 @@ from __future__ import annotations
 
 from ap_agent.config import Settings
 from ap_agent.erp.base import ERPConnector, ERPError
-from ap_agent.storage.db import Database
+from ap_agent.storage.secrets import SecretStore
 
 
-def build_erp(settings: Settings, db: Database) -> ERPConnector:
+def build_erp(settings: Settings, secrets: SecretStore, entity: str = "default") -> ERPConnector:
+    """Build the ERP connector for one entity. Rotating tokens are namespaced by entity."""
     p = settings.erp_provider
+
+    def token_get(key: str) -> str | None:
+        return secrets.get(f"{entity}.{key}")
+
+    def token_set(key: str, value: str) -> None:
+        secrets.set(f"{entity}.{key}", value)
+
     if p == "memory":
         from ap_agent.erp.memory import InMemoryERP
 
@@ -25,11 +33,11 @@ def build_erp(settings: Settings, db: Database) -> ERPConnector:
     if p == "quickbooks":
         from ap_agent.erp.quickbooks import QuickBooksERP
 
-        return QuickBooksERP(settings.quickbooks_client_id, settings.quickbooks_client_secret, settings.quickbooks_realm_id, settings.quickbooks_refresh_token, db.kv_get, db.kv_set, sandbox=settings.quickbooks_sandbox, bank_account_id=settings.quickbooks_bank_account_id)
+        return QuickBooksERP(settings.quickbooks_client_id, settings.quickbooks_client_secret, settings.quickbooks_realm_id, settings.quickbooks_refresh_token, token_get, token_set, sandbox=settings.quickbooks_sandbox, bank_account_id=settings.quickbooks_bank_account_id)
     if p == "xero":
         from ap_agent.erp.xero import XeroERP
 
-        return XeroERP(settings.xero_client_id, settings.xero_client_secret, settings.xero_tenant_id, settings.xero_refresh_token, db.kv_get, db.kv_set, bank_account_code=settings.xero_bank_account_code)
+        return XeroERP(settings.xero_client_id, settings.xero_client_secret, settings.xero_tenant_id, settings.xero_refresh_token, token_get, token_set, bank_account_code=settings.xero_bank_account_code)
     raise ValueError(f"Unknown erp_provider {p!r}")
 
 

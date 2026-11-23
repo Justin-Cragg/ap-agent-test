@@ -20,6 +20,11 @@ class InMemoryERP(ERPConnector):
         self.bills: dict[str, Bill] = {}
         self.accounts: list[GLAccount] = []
         self.payments: list[dict] = []
+        self.credits: dict[str, Bill] = {}
+        self.bank_accounts: dict[str, list[str]] = {}
+        self.fx: dict[tuple[str, str], Decimal] = {}
+        self.idempotency: dict[str, str] = {}
+        self.create_calls = 0
         self._ids = itertools.count(1000)
 
     @classmethod
@@ -73,8 +78,12 @@ class InMemoryERP(ERPConnector):
     def list_gl_accounts(self):
         return list(self.accounts)
 
-    def create_bill(self, draft: BillDraft) -> Bill:
+    def create_bill(self, draft: BillDraft, idempotency_key: str) -> Bill:
+        self.create_calls += 1
+        if idempotency_key in self.idempotency:
+            return self.bills[self.idempotency[idempotency_key]]
         bill_id = f"B{next(self._ids)}"
+        self.idempotency[idempotency_key] = bill_id
         bill = Bill(id=bill_id, vendor_id=draft.vendor_id, invoice_number=draft.invoice_number, invoice_date=draft.invoice_date, due_date=draft.due_date, total=draft.total, balance=draft.total, currency=draft.currency, status=BillStatus.open, po_number=draft.po_number)
         self.bills[bill_id] = bill
         if draft.po_number and draft.po_number in self.pos:
@@ -85,10 +94,28 @@ class InMemoryERP(ERPConnector):
                         pl.quantity_billed += line.quantity
         return bill
 
-    def record_payment(self, bill, amount, payment_date):
+    def create_credit(self, draft: BillDraft, idempotency_key: str) -> Bill:
+        if idempotency_key in self.idempotency:
+            return self.credits[self.idempotency[idempotency_key]]
+        cid = f"C{next(self._ids)}"
+        self.idempotency[idempotency_key] = cid
+        credit = Bill(id=cid, vendor_id=draft.vendor_id, invoice_number=draft.invoice_number, invoice_date=draft.invoice_date, total=-draft.total, balance=-draft.total, currency=draft.currency, status=BillStatus.open)
+        self.credits[cid] = credit
+        return credit
+
+    def record_payment(self, bill, amount, payment_date, idempotency_key):
+        if idempotency_key in self.idempotency:
+            return self.idempotency[idempotency_key]
         stored = self.bills[bill.id]
-        stored.balance = (stored.balance or stored.total) - amount
+        stored.balance = (stored.balance if stored.balance is not None else stored.total) - amount
         stored.status = BillStatus.paid if stored.balance <= 0 else BillStatus.partially_paid
         pid = f"PMT{next(self._ids)}"
+        self.idempotency[idempotency_key] = pid
         self.payments.append({"id": pid, "bill_id": bill.id, "amount": str(amount), "date": payment_date.isoformat()})
         return pid
+
+    def vendor_bank_accounts(self, vendor_id):
+        return self.bank_accounts.get(vendor_id)
+
+    def exchange_rate(self, from_ccy, to_ccy, on):
+        return self.fx.get((from_ccy, to_ccy))

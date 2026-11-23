@@ -9,3 +9,6 @@ dist/
 *.egg-info/
 .terraform/
 *.tfstate*
+
+# real eval documents
+evals/cases/*/

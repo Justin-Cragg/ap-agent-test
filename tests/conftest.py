@@ -91,7 +91,21 @@ class FakeAnthropic:
 
 @pytest.fixture
 def settings(tmp_path):
-    return Settings(_env_file=None, database_url=f"sqlite:///{tmp_path}/t.db", blob_bucket=str(tmp_path / "blobs"), api_token="test-token", policy_file=None, llm_provider="anthropic", erp_provider="memory", mail_provider="memory")
+    return Settings(_env_file=None, database_url=f"sqlite:///{tmp_path}/t.db", blob_bucket=str(tmp_path / "blobs"), api_token="test-token", policy_file=None, rbac_file=None, entities_file=None,
+                    llm_provider="anthropic", erp_provider="memory", mail_provider="memory", webhook_secret="hook-secret", bank_fingerprint_pepper="pepper", log_format="text")
+
+
+def user(email: str, *roles: str, mfa: bool = True, entities=("*",), groups=()):
+    from ap_agent.auth import RBAC
+
+    rbac = RBAC({}, {email: {"roles": list(roles), "entities": list(entities)}})
+    p = rbac.principal(email=email, groups=list(groups), mfa=mfa)
+    return p
+
+
+@pytest.fixture
+def live_policy():
+    return Policy(auto_post_mode="live")
 
 
 @pytest.fixture
@@ -99,15 +113,19 @@ def fake_client():
     return FakeAnthropic()
 
 
-@pytest.fixture
-def service(settings, fake_client, tmp_path):
-    db = Database(settings.database_url)
+def make_service(settings, fake_client, tmp_path, policy=None, **kw):
     return APService(
         settings,
         llm=LLM(settings, client=fake_client),
-        erp=InMemoryERP.with_demo_data(),
-        mailbox=InMemoryMailbox(),
-        db=db,
+        erp=kw.pop("erp", None) or InMemoryERP.with_demo_data(),
+        mailbox=kw.pop("mailbox", None) or InMemoryMailbox(),
+        db=Database(settings.database_url),
         blobs=LocalBlobStore(str(tmp_path / "blobs")),
-        policy=Policy(),
+        policy=policy,
+        **kw,
     )
+
+
+@pytest.fixture
+def service(settings, fake_client, tmp_path, live_policy):
+    return make_service(settings, fake_client, tmp_path, policy=live_policy)

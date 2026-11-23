@@ -13,7 +13,7 @@ COPY config ./config
 USER app
 ENV PORT=8080 PYTHONUNBUFFERED=1
 EXPOSE 8080
-# Service:   ap-agent serve          (approval UI + API + webhooks)
-# Scheduled: ap-agent poll           (Cloud Run Job / ECS scheduled task / Container Apps Job)
-#            ap-agent payment-run
-CMD ["sh", "-c", "exec ap-agent serve --port ${PORT}"]
+# Service:   migrate (advisory-locked, safe with many replicas) then serve
+# Scheduled: ap-agent poll | payment-run | purge          (agent identity)
+#            ap-agent execute-payments                    (payment-executor identity)
+CMD ["sh", "-c", "ap-agent migrate && exec ap-agent serve --port ${PORT}"]

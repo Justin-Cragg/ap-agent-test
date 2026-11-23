@@ -70,9 +70,24 @@ class NetSuiteERP(ERPConnector):
         body = resp.json()
         return body["access_token"], int(body.get("expires_in", 3600))
 
-    def _suiteql(self, query: str, limit: int = 200) -> list[dict]:
-        resp = self.api.post(f"/query/v1/suiteql?limit={limit}", json={"q": query}, headers={"Prefer": "transient"})
-        return resp.json().get("items", [])
+    def _suiteql(self, query: str, limit: int = 200, max_rows: int = 20000) -> list[dict]:
+        """SuiteQL with offset pagination (queries are read-only, so safe to retry)."""
+        rows: list[dict] = []
+        offset = 0
+        while True:
+            page = self.api.post(f"/query/v1/suiteql?limit={limit}&offset={offset}", json={"q": query}, headers={"Prefer": "transient"}, idempotent=True).json()
+            rows += page.get("items", [])
+            if not page.get("hasMore") or len(rows) >= max_rows:
+                return rows
+            offset += limit
+
+    def _by_external_id(self, record: str, key: str) -> str | None:
+        try:
+            return str(self.api.get(f"/record/v1/{record}/eid:{key}")["id"])
+        except ERPError as e:
+            if e.status == 404:
+                return None
+            raise
 
     # ------------------------------------------------------------------ reads
     def _vendor(self, row: dict) -> Vendor:
@@ -87,10 +102,11 @@ class NetSuiteERP(ERPConnector):
             payment_terms=row.get("terms_name"),
             active=row.get("isinactive", "F") != "T",
             default_gl_account=str(row["expenseaccount"]) if row.get("expenseaccount") else None,
+            is_1099=row.get("is1099eligible") == "T",
         )
 
     _VENDOR_SQL = (
-        "SELECT v.id, v.entityid, v.companyname, v.email, v.taxidnum, v.isinactive, v.expenseaccount, "
+        "SELECT v.id, v.entityid, v.companyname, v.email, v.taxidnum, v.isinactive, v.expenseaccount, v.is1099eligible, "
         "BUILTIN.DF(v.currency) AS currency_code, BUILTIN.DF(v.terms) AS terms_name FROM vendor v WHERE "
     )
 
@@ -149,38 +165,75 @@ class NetSuiteERP(ERPConnector):
         where = "t.status = 'VendBill:A'"
         if due_before:
             where += f" AND t.duedate <= TO_DATE('{due_before.isoformat()}', 'YYYY-MM-DD')"
-        return [self._bill(r) for r in self._suiteql(self._BILL_SQL + where, limit=1000)]
+        return [self._bill(r) for r in self._suiteql(self._BILL_SQL + where, limit=1000, max_rows=100000)]
 
     def list_gl_accounts(self):
         rows = self._suiteql("SELECT id, acctnumber, fullname, accttype FROM account WHERE isinactive = 'F' AND accttype IN ('Expense', 'COGS', 'OthExpense', 'FixedAsset', 'OthCurrAsset')", limit=1000)
         return [GLAccount(id=str(r["id"]), number=r.get("acctnumber") or str(r["id"]), name=r.get("fullname") or "", type=r.get("accttype")) for r in rows]
 
     # ------------------------------------------------------------------ writes
-    def create_bill(self, draft: BillDraft) -> Bill:
-        body: dict = {"tranId": draft.invoice_number, "tranDate": draft.invoice_date.isoformat(), "memo": draft.memo or ""}
-        if draft.due_date:
-            body["dueDate"] = draft.due_date.isoformat()
-        expense = [ln for ln in draft.lines if not ln.po_line_id]
-        if expense:
-            body["expense"] = {"items": [{"account": {"id": ln.gl_account}, "amount": float(ln.amount), "memo": ln.description[:999]} for ln in expense]}
-        if draft.po_id:
-            # Transform keeps the PO link; NetSuite pre-fills the unbilled PO lines.
-            # Restrict to the invoiced quantities.
-            po_lines = {ln.po_line_id: ln for ln in draft.lines if ln.po_line_id}
-            body["item"] = {"items": [{"orderLine": int(lid), "quantity": float(ln.quantity or 0), "rate": float(ln.unit_price or 0)} for lid, ln in po_lines.items()]}
-            resp = self.api.post(f"/record/v1/purchaseOrder/{draft.po_id}/!transform/vendorBill", json=body)
-        else:
-            body["entity"] = {"id": draft.vendor_id}
-            resp = self.api.post("/record/v1/vendorBill", json=body)
-        bill_id = resp.headers.get("Location", "").rstrip("/").split("/")[-1]
-        return Bill(id=bill_id, vendor_id=draft.vendor_id, invoice_number=draft.invoice_number, invoice_date=draft.invoice_date, due_date=draft.due_date, total=draft.total, balance=draft.total, currency=draft.currency, status=BillStatus.open, po_number=draft.po_number)
+    # Every write carries externalId = idempotency key. NetSuite enforces it as
+    # unique per record type, so a retried POST can't create a second bill; we
+    # look the record up by eid: first and after any failure.
 
-    def record_payment(self, bill: Bill, amount: Decimal, payment_date: date) -> str:
-        body = {"tranDate": payment_date.isoformat(), "apply": {"items": [{"doc": {"id": bill.id}, "apply": True, "amount": float(amount)}]}}
+    def _expense_items(self, lines):
+        return {"items": [{"account": {"id": ln.gl_account}, "amount": float(ln.amount), "memo": ln.description[:999]} for ln in lines]}
+
+    def create_bill(self, draft: BillDraft, idempotency_key: str) -> Bill:
+        existing = self._by_external_id("vendorBill", idempotency_key)
+        if existing is None:
+            body: dict = {"externalId": idempotency_key, "tranId": draft.invoice_number, "tranDate": draft.invoice_date.isoformat(), "memo": draft.memo or ""}
+            if draft.due_date:
+                body["dueDate"] = draft.due_date.isoformat()
+            expense = [ln for ln in draft.lines if not ln.po_line_id]
+            if expense:
+                body["expense"] = self._expense_items(expense)
+            try:
+                if draft.po_id:
+                    # Transform keeps the PO link; restrict to the invoiced quantities.
+                    po_lines = {ln.po_line_id: ln for ln in draft.lines if ln.po_line_id}
+                    body["item"] = {"items": [{"orderLine": int(lid), "quantity": float(ln.quantity or 0), "rate": float(ln.unit_price or 0)} for lid, ln in po_lines.items()]}
+                    resp = self.api.post(f"/record/v1/purchaseOrder/{draft.po_id}/!transform/vendorBill", json=body, idempotent=True)
+                else:
+                    body["entity"] = {"id": draft.vendor_id}
+                    if draft.subsidiary_id:
+                        body["subsidiary"] = {"id": draft.subsidiary_id}
+                    resp = self.api.post("/record/v1/vendorBill", json=body, idempotent=True)
+                existing = resp.headers.get("Location", "").rstrip("/").split("/")[-1]
+            except ERPError:
+                existing = self._by_external_id("vendorBill", idempotency_key)
+                if existing is None:
+                    raise
+        return Bill(id=existing, vendor_id=draft.vendor_id, invoice_number=draft.invoice_number, invoice_date=draft.invoice_date, due_date=draft.due_date, total=draft.total, balance=draft.total, currency=draft.currency, status=BillStatus.open, po_number=draft.po_number)
+
+    def create_credit(self, draft: BillDraft, idempotency_key: str) -> Bill:
+        existing = self._by_external_id("vendorCredit", idempotency_key)
+        if existing is None:
+            body = {"externalId": idempotency_key, "entity": {"id": draft.vendor_id}, "tranId": draft.invoice_number, "tranDate": draft.invoice_date.isoformat(), "memo": draft.memo or "", "expense": self._expense_items(draft.lines)}
+            if draft.subsidiary_id:
+                body["subsidiary"] = {"id": draft.subsidiary_id}
+            resp = self.api.post("/record/v1/vendorCredit", json=body, idempotent=True)
+            existing = resp.headers.get("Location", "").rstrip("/").split("/")[-1]
+        return Bill(id=existing, vendor_id=draft.vendor_id, invoice_number=draft.invoice_number, invoice_date=draft.invoice_date, total=-draft.total, balance=-draft.total, currency=draft.currency, status=BillStatus.open)
+
+    def record_payment(self, bill: Bill, amount: Decimal, payment_date: date, idempotency_key: str) -> str:
+        existing = self._by_external_id("vendorPayment", idempotency_key)
+        if existing:
+            return existing
+        body = {"externalId": idempotency_key, "tranDate": payment_date.isoformat(), "apply": {"items": [{"doc": {"id": bill.id}, "apply": True, "amount": float(amount)}]}}
         if self.payment_account_id:
             body["account"] = {"id": self.payment_account_id}
-        resp = self.api.post(f"/record/v1/vendorBill/{bill.id}/!transform/vendorPayment", json=body)
+        resp = self.api.post(f"/record/v1/vendorBill/{bill.id}/!transform/vendorPayment", json=body, idempotent=True)
         return resp.headers.get("Location", "").rstrip("/").split("/")[-1]
+
+    def exchange_rate(self, from_ccy: str, to_ccy: str, on: date) -> Decimal | None:
+        rows = self._suiteql(
+            "SELECT cr.exchangerate FROM currencyrate cr JOIN currency t ON cr.transactioncurrency = t.id "
+            f"JOIN currency b ON cr.basecurrency = b.id WHERE t.symbol = '{_q(from_ccy)}' AND b.symbol = '{_q(to_ccy)}' "
+            f"AND cr.effectivedate <= TO_DATE('{on.isoformat()}', 'YYYY-MM-DD') ORDER BY cr.effectivedate DESC",
+            limit=1, max_rows=1,
+        )
+        return dec(rows[0]["exchangerate"]) if rows else None
 
 
 def _ns_date(value):

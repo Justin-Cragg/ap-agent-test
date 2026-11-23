@@ -27,12 +27,12 @@ class DuplicateCheck(BaseModel):
     matches: list[str] = Field(default_factory=list)
 
 
-def check_duplicate(erp: ERPConnector, db: Database, *, vendor_id: str, invoice_number: str, total: Decimal, invoice_date: date | None, window_days: int, exclude_invoice_id: str | None = None) -> DuplicateCheck:
+def check_duplicate(erp: ERPConnector, db: Database, *, vendor_id: str, invoice_number: str, total: Decimal, invoice_date: date | None, window_days: int, exclude_invoice_id: str | None = None, entity: str = "default", document_type: str = "invoice") -> DuplicateCheck:
     norm = normalize_invoice_number(invoice_number)
     matches: list[str] = []
     verdict = "none"
 
-    for bill in erp.find_bills(vendor_id=vendor_id):
+    for bill in (erp.find_bills(vendor_id=vendor_id) if document_type == "invoice" else []):
         if bill.status == BillStatus.void:
             continue
         if normalize_invoice_number(bill.invoice_number) == norm:
@@ -44,7 +44,7 @@ def check_duplicate(erp: ERPConnector, db: Database, *, vendor_id: str, invoice_
             matches.append(f"ERP bill {bill.id} ({bill.invoice_number}) same amount within {window_days} days")
 
     with db.session() as s:
-        rows = s.scalars(select(InvoiceRecord).where(InvoiceRecord.vendor_id == vendor_id, InvoiceRecord.status.notin_(["rejected", "duplicate"]))).all()
+        rows = s.scalars(select(InvoiceRecord).where(InvoiceRecord.entity == entity, InvoiceRecord.vendor_id == vendor_id, InvoiceRecord.document_type == document_type, InvoiceRecord.status.notin_(["rejected", "duplicate"]))).all()
     for rec in rows:
         if rec.id == exclude_invoice_id:
             continue

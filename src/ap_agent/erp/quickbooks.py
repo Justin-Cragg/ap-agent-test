@@ -54,11 +54,23 @@ class QuickBooksERP(ERPConnector):
     def _query(self, sql: str) -> dict:
         return self.api.get("/query", params={"query": sql, "minorversion": MINOR_VERSION}).get("QueryResponse", {})
 
+    def _query_all(self, sql: str, entity: str, page: int = 1000, max_rows: int = 100000) -> list[dict]:
+        """Paginate with STARTPOSITION / MAXRESULTS."""
+        rows: list[dict] = []
+        start = 1
+        while len(rows) < max_rows:
+            batch = self._query(f"{sql} STARTPOSITION {start} MAXRESULTS {page}").get(entity, [])
+            rows += batch
+            if len(batch) < page:
+                break
+            start += page
+        return rows
+
     # ------------------------------------------------------------------ reads
     @staticmethod
     def _vendor(v: dict) -> Vendor:
         email = (v.get("PrimaryEmailAddr") or {}).get("Address")
-        return Vendor(id=v["Id"], name=v.get("DisplayName") or v.get("CompanyName", ""), tax_id=v.get("TaxIdentifier"), email=email, email_domains=[email.split("@")[-1].lower()] if email else [], currency=(v.get("CurrencyRef") or {}).get("value"), payment_terms=(v.get("TermRef") or {}).get("name"), active=v.get("Active", True))
+        return Vendor(id=v["Id"], name=v.get("DisplayName") or v.get("CompanyName", ""), tax_id=v.get("TaxIdentifier"), email=email, email_domains=[email.split("@")[-1].lower()] if email else [], currency=(v.get("CurrencyRef") or {}).get("value"), payment_terms=(v.get("TermRef") or {}).get("name"), active=v.get("Active", True), is_1099=bool(v.get("Vendor1099")))
 
     def search_vendors(self, *, name=None, tax_id=None, email=None):
         found: dict[str, Vendor] = {}
@@ -67,7 +79,7 @@ class QuickBooksERP(ERPConnector):
                 found[v["Id"]] = self._vendor(v)
         if email or tax_id:
             # QBO can't filter on email/tax id server-side; scan active vendors.
-            for v in self._query("SELECT * FROM Vendor WHERE Active = true MAXRESULTS 1000").get("Vendor", []):
+            for v in self._query_all("SELECT * FROM Vendor WHERE Active = true", "Vendor"):
                 vend = self._vendor(v)
                 if email and email.split("@")[-1].lower() in vend.email_domains:
                     found[vend.id] = vend
@@ -107,36 +119,58 @@ class QuickBooksERP(ERPConnector):
         sql = f"SELECT * FROM Bill WHERE VendorRef = '{_q(vendor_id)}'"
         if invoice_number:
             sql += f" AND DocNumber = '{_q(invoice_number)}'"
-        return [self._bill(b) for b in self._query(sql + " MAXRESULTS 100").get("Bill", [])]
+        return [self._bill(b) for b in self._query_all(sql, "Bill")]
 
     def list_open_bills(self, *, due_before=None):
         sql = "SELECT * FROM Bill WHERE Balance > '0'"
         if due_before:
             sql += f" AND DueDate <= '{due_before.isoformat()}'"
-        return [self._bill(b) for b in self._query(sql + " MAXRESULTS 1000").get("Bill", [])]
+        return [self._bill(b) for b in self._query_all(sql, "Bill")]
 
     def list_gl_accounts(self):
-        rows = self._query("SELECT * FROM Account WHERE Classification IN ('Expense', 'Asset') AND Active = true MAXRESULTS 1000").get("Account", [])
+        rows = self._query_all("SELECT * FROM Account WHERE Classification IN ('Expense', 'Asset') AND Active = true", "Account")
         return [GLAccount(id=a["Id"], number=a.get("AcctNum") or a["Id"], name=a.get("FullyQualifiedName", a.get("Name", "")), type=a.get("AccountType")) for a in rows]
 
     # ------------------------------------------------------------------ writes
-    def create_bill(self, draft: BillDraft) -> Bill:
+    # Intuit's `requestid` makes POSTs idempotent: a retry with the same id
+    # returns the original response instead of creating a second record.
+
+    def _expense_lines(self, draft: BillDraft, link_po: bool) -> list[dict]:
         lines = []
         for ln in draft.lines:
             line = {"DetailType": "AccountBasedExpenseLineDetail", "Amount": float(ln.amount), "Description": ln.description[:4000], "AccountBasedExpenseLineDetail": {"AccountRef": {"value": ln.gl_account}}}
-            if ln.po_line_id and draft.po_id:
+            if link_po and ln.po_line_id and draft.po_id:
                 line["LinkedTxn"] = [{"TxnId": draft.po_id, "TxnType": "PurchaseOrder", "TxnLineId": ln.po_line_id}]
             lines.append(line)
-        body = {"VendorRef": {"value": draft.vendor_id}, "DocNumber": draft.invoice_number[:21], "TxnDate": draft.invoice_date.isoformat(), "Line": lines, "PrivateNote": (draft.memo or "")[:4000]}
+        return lines
+
+    def _write(self, path: str, body: dict, key: str) -> dict:
+        return self.api.post(path, params={"minorversion": MINOR_VERSION, "requestid": key[:50]}, json=body, idempotent=True).json()
+
+    def create_bill(self, draft: BillDraft, idempotency_key: str) -> Bill:
+        body = {"VendorRef": {"value": draft.vendor_id}, "DocNumber": draft.invoice_number[:21], "TxnDate": draft.invoice_date.isoformat(), "Line": self._expense_lines(draft, True), "PrivateNote": (draft.memo or "")[:4000]}
         if draft.due_date:
             body["DueDate"] = draft.due_date.isoformat()
         if draft.currency:
             body["CurrencyRef"] = {"value": draft.currency}
-        bill = self.api.post("/bill", params={"minorversion": MINOR_VERSION}, json=body).json()["Bill"]
-        return self._bill(bill)
+        return self._bill(self._write("/bill", body, idempotency_key)["Bill"])
 
-    def record_payment(self, bill: Bill, amount: Decimal, payment_date: date) -> str:
+    def create_credit(self, draft: BillDraft, idempotency_key: str) -> Bill:
+        body = {"VendorRef": {"value": draft.vendor_id}, "DocNumber": draft.invoice_number[:21], "TxnDate": draft.invoice_date.isoformat(), "Line": self._expense_lines(draft, False)}
+        if draft.currency:
+            body["CurrencyRef"] = {"value": draft.currency}
+        vc = self._write("/vendorcredit", body, idempotency_key)["VendorCredit"]
+        return Bill(id=vc["Id"], vendor_id=draft.vendor_id, invoice_number=draft.invoice_number, invoice_date=draft.invoice_date, total=-draft.total, balance=-draft.total, currency=draft.currency, status=BillStatus.open)
+
+    def record_payment(self, bill: Bill, amount: Decimal, payment_date: date, idempotency_key: str) -> str:
         if not self.bank_account_id:
             raise ERPError("QUICKBOOKS_BANK_ACCOUNT_ID is not configured")
         body = {"VendorRef": {"value": bill.vendor_id}, "PayType": "Check", "CheckPayment": {"BankAccountRef": {"value": self.bank_account_id}}, "TotalAmt": float(amount), "TxnDate": payment_date.isoformat(), "Line": [{"Amount": float(amount), "LinkedTxn": [{"TxnId": bill.id, "TxnType": "Bill"}]}]}
-        return self.api.post("/billpayment", params={"minorversion": MINOR_VERSION}, json=body).json()["BillPayment"]["Id"]
+        return self._write("/billpayment", body, idempotency_key)["BillPayment"]["Id"]
+
+    def exchange_rate(self, from_ccy: str, to_ccy: str, on: date) -> Decimal | None:
+        try:
+            r = self.api.get("/exchangerate", params={"sourcecurrencycode": from_ccy, "asofdate": on.isoformat(), "minorversion": MINOR_VERSION}).get("ExchangeRate", {})
+        except ERPError:
+            return None
+        return dec(r["Rate"]) if r.get("Rate") and r.get("TargetCurrencyCode") == to_ccy else None
